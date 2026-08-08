@@ -4,6 +4,23 @@ import express, {
   type Response,
 } from "express";
 import type { Pool } from "pg";
+import { createLogsRouter } from "./routes/logs.routes.js";
+
+function getHttpErrorStatus(error: unknown): number | undefined {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "status" in error
+  ) {
+    const status = (error as { status?: unknown }).status;
+
+    if (typeof status === "number") {
+      return status;
+    }
+  }
+
+  return undefined;
+}
 
 export function createApp(pool: Pool) {
   const app = express();
@@ -35,6 +52,8 @@ export function createApp(pool: Pool) {
     },
   );
 
+  app.use(createLogsRouter(pool));
+
   app.use(
     (
       error: unknown,
@@ -42,6 +61,24 @@ export function createApp(pool: Pool) {
       response: Response,
       _next: NextFunction,
     ): void => {
+      const status = getHttpErrorStatus(error);
+
+      if (error instanceof SyntaxError && status === 400) {
+        response.status(400).json({
+          error: "invalid JSON",
+        });
+
+        return;
+      }
+
+      if (status === 413) {
+        response.status(413).json({
+          error: "request body too large",
+        });
+
+        return;
+      }
+
       console.error("Unhandled request error:", error);
 
       response.status(500).json({
