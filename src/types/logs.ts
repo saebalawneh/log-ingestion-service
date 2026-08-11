@@ -19,6 +19,26 @@ export type RejectedLog = {
   reason: string;
 };
 
+export type LogQuery = {
+  service?: string;
+  level?: LogLevel;
+  since?: string;
+  until?: string;
+  q?: string;
+  attributes: Record<string, string>;
+  limit: number;
+};
+
+export type LogQueryValidationResult =
+  | {
+      ok: true;
+      query: LogQuery;
+    }
+  | {
+      ok: false;
+      error: string;
+    };
+    
 export type ValidationResult =
   | {
       ok: true;
@@ -28,3 +48,12 @@ export type ValidationResult =
       ok: false;
       rejection: RejectedLog;
     };
+
+    export type StoredLog = {
+  id: string;
+  timestamp: Date;
+  level: LogLevel;
+  service: string;
+  message: string;
+  attributes: LogAttributes;
+};

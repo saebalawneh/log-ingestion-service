@@ -1,5 +1,9 @@
 import type { Pool, PoolClient } from "pg";
-import type { LogEntry } from "../types/logs.js";
+import type {
+  LogEntry,
+  LogQuery,
+  StoredLog,
+} from "../types/logs.js";
 
 const INSERT_CHUNK_SIZE = 1000;
 
@@ -74,3 +78,97 @@ export async function insertLogs(
     client.release();
   }
 }
+
+
+export async function findLogs(
+  pool: Pool,
+  query: LogQuery,
+): Promise<StoredLog[]> {
+  const conditions: string[] = [];
+  const values: unknown[] = [];
+
+  if (query.service !== undefined) {
+    values.push(query.service);
+
+    conditions.push(
+      `service = $${values.length}`,
+    );
+  }
+
+  if (query.level !== undefined) {
+    values.push(query.level);
+
+    conditions.push(
+      `level = $${values.length}`,
+    );
+  }
+
+  if (query.since !== undefined) {
+    values.push(query.since);
+
+    conditions.push(
+      `"timestamp" >= $${values.length}::timestamptz`,
+    );
+  }
+
+  if (query.until !== undefined) {
+    values.push(query.until);
+
+    conditions.push(
+      `"timestamp" < $${values.length}::timestamptz`,
+    );
+  }
+
+  for (const [key, value] of Object.entries(query.attributes)) {
+    values.push(key);
+
+    const keyPlaceholder = `$${values.length}`;
+
+    values.push(value);
+
+    const valuePlaceholder = `$${values.length}`;
+
+    conditions.push(
+      `attributes ->> ${keyPlaceholder}::text = ${valuePlaceholder}`,
+    );
+  }
+
+  if (query.q !== undefined) {
+    values.push(query.q);
+
+    conditions.push(
+      `STRPOS(LOWER(message), LOWER($${values.length})) > 0`,
+    );
+  }
+
+  const whereClause =
+    conditions.length > 0
+      ? `WHERE ${conditions.join(" AND ")}`
+      : "";
+
+  values.push(query.limit);
+
+  const limitPlaceholder = `$${values.length}`;
+
+  const sql = `
+    SELECT
+      id,
+      "timestamp",
+      level,
+      service,
+      message,
+      attributes
+    FROM logs
+    ${whereClause}
+    ORDER BY "timestamp" DESC, id DESC
+    LIMIT ${limitPlaceholder}
+  `;
+
+  const result = await pool.query<StoredLog>(
+    sql,
+    values,
+  );
+
+  return result.rows;
+}
+
