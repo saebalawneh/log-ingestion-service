@@ -19,6 +19,11 @@ export type RejectedLog = {
   reason: string;
 };
 
+export type LogCursor = {
+  timestamp: string;
+  id: string;
+};
+
 export type LogQuery = {
   service?: string;
   level?: LogLevel;
@@ -27,6 +32,7 @@ export type LogQuery = {
   q?: string;
   attributes: Record<string, string>;
   limit: number;
+  cursor?: LogCursor;
 };
 
 export type LogQueryValidationResult =

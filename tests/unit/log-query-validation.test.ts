@@ -1,7 +1,49 @@
 import { describe, expect, test } from "vitest";
 import { validateLogQuery } from "../../src/validation/log-query-validation.js";
+import { encodeLogCursor } from "../../src/utils/log-cursor.js";
 
 describe("validateLogQuery", () => {
+
+    test("accepts and decodes a valid cursor", () => {
+  const cursor = encodeLogCursor({
+    timestamp: "2026-08-11T10:00:00.000Z",
+    id: "25",
+  });
+
+  const result = validateLogQuery({
+    cursor,
+  });
+
+  expect(result.ok).toBe(true);
+
+  if (result.ok) {
+    expect(result.query.cursor).toEqual({
+      timestamp: "2026-08-11T10:00:00.000Z",
+      id: "25",
+    });
+  }
+});
+
+test("rejects an invalid cursor", () => {
+  const result = validateLogQuery({
+    cursor: "not-a-valid-cursor",
+  });
+
+  expect(result).toEqual({
+    ok: false,
+    error: "invalid cursor",
+  });
+});
+
+test("rejects a non-ISO date even if Date.parse could understand it", () => {
+  const result = validateLogQuery({
+    since: "August 11, 2026",
+  });
+
+  expect(result.ok).toBe(false);
+});
+
+
   test("uses the default limit when limit is omitted", () => {
     const result = validateLogQuery({});
 

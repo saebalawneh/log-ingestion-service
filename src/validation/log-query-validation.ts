@@ -4,6 +4,10 @@ import {
   type LogQuery,
   type LogQueryValidationResult,
 } from "../types/logs.js";
+import { decodeLogCursor } from "../utils/log-cursor.js";
+
+const ISO_8601_DATE_TIME =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i;
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1000;
@@ -45,12 +49,16 @@ function parseLimit(value: unknown): number | undefined {
 }
 
 function isValidDateTime(value: string): boolean {
-  return Number.isFinite(Date.parse(value));
+  return (
+    ISO_8601_DATE_TIME.test(value) &&
+    Number.isFinite(Date.parse(value))
+  );
 }
 
 export function validateLogQuery(
   input: Record<string, unknown>,
 ): LogQueryValidationResult {
+    const cursorValue = getSingleQueryValue(input.cursor);
   const service = getSingleQueryValue(input.service);
   const level = getSingleQueryValue(input.level);
   const since = getSingleQueryValue(input.since);
@@ -65,6 +73,25 @@ export function validateLogQuery(
       error: "limit must be an integer between 1 and 1000",
     };
   }
+if (
+  input.cursor !== undefined &&
+  cursorValue === undefined
+) {
+  return {
+    ok: false,
+    error: "invalid cursor",
+  };
+}
+const cursor =
+  cursorValue === undefined
+    ? undefined
+    : decodeLogCursor(cursorValue);
+    if (cursor === null) {
+  return {
+    ok: false,
+    error: "invalid cursor",
+  };
+}
 
   if (level !== undefined && !isLogLevel(level)) {
     return {
@@ -150,7 +177,9 @@ export function validateLogQuery(
   if (q !== undefined) {
     query.q = q;
   }
-
+if (cursor !== undefined && cursor !== null) {
+  query.cursor = cursor;
+}
   return {
     ok: true,
     query,

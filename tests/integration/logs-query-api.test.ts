@@ -260,4 +260,91 @@ describe("GET /logs", () => {
 
     expect(response.status).toBe(400);
   });
+
+  test("paginates with a cursor without duplicates", async () => {
+    await seedLog({
+      timestamp: "2026-08-11T09:59:00.000Z",
+      level: "info",
+      service: "api",
+      message: "older",
+    });
+
+    await seedLog({
+      timestamp: "2026-08-11T10:00:00.000Z",
+      level: "info",
+      service: "api",
+      message: "same timestamp first",
+    });
+
+    await seedLog({
+      timestamp: "2026-08-11T10:00:00.000Z",
+      level: "info",
+      service: "api",
+      message: "same timestamp second",
+    });
+
+    await seedLog({
+      timestamp: "2026-08-11T10:00:00.000Z",
+      level: "info",
+      service: "api",
+      message: "same timestamp third",
+    });
+
+    const firstPage = await request(app)
+      .get("/logs")
+      .query({
+        limit: "2",
+      });
+
+    expect(firstPage.status).toBe(200);
+    expect(firstPage.body.logs).toHaveLength(2);
+
+    expect(
+      firstPage.body.logs.map(
+        (log: { message: string }) => log.message,
+      ),
+    ).toEqual([
+      "same timestamp third",
+      "same timestamp second",
+    ]);
+
+    expect(firstPage.body.next_cursor).toEqual(
+      expect.any(String),
+    );
+
+    const secondPage = await request(app)
+      .get("/logs")
+      .query({
+        limit: "2",
+        cursor: firstPage.body.next_cursor,
+      });
+
+    expect(secondPage.status).toBe(200);
+    expect(secondPage.body.logs).toHaveLength(2);
+
+    expect(
+      secondPage.body.logs.map(
+        (log: { message: string }) => log.message,
+      ),
+    ).toEqual([
+      "same timestamp first",
+      "older",
+    ]);
+
+    expect(secondPage.body.next_cursor).toBe(null);
+  });
+
+  test("returns 400 for an invalid cursor", async () => {
+    const response = await request(app)
+      .get("/logs")
+      .query({
+        cursor: "this-is-not-a-valid-cursor",
+      });
+
+    expect(response.status).toBe(400);
+
+    expect(response.body).toEqual({
+      error: "invalid cursor",
+    });
+  });
 });

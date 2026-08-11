@@ -141,12 +141,30 @@ export async function findLogs(
     );
   }
 
+if (query.cursor !== undefined) {
+  values.push(query.cursor.timestamp);
+  const timestampPlaceholder = `$${values.length}`;
+
+  values.push(query.cursor.id);
+  const idPlaceholder = `$${values.length}`;
+
+  conditions.push(`
+    (
+      "timestamp" < ${timestampPlaceholder}::timestamptz
+      OR (
+        "timestamp" = ${timestampPlaceholder}::timestamptz
+        AND id < ${idPlaceholder}::bigint
+      )
+    )
+  `);
+}
+
   const whereClause =
     conditions.length > 0
       ? `WHERE ${conditions.join(" AND ")}`
       : "";
 
-  values.push(query.limit);
+values.push(query.limit + 1);
 
   const limitPlaceholder = `$${values.length}`;
 
