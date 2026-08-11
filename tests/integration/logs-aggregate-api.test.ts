@@ -71,6 +71,77 @@ afterAll(async () => {
 });
 
 describe("GET /logs/aggregate", () => {
+
+test("groups aggregation by level", async () => {
+  await seedLog(
+    "2026-08-11T10:01:00.000Z",
+    "info",
+    "api",
+    "info log",
+  );
+
+  await seedLog(
+    "2026-08-11T10:02:00.000Z",
+    "error",
+    "api",
+    "error log one",
+  );
+
+  await seedLog(
+    "2026-08-11T10:03:00.000Z",
+    "error",
+    "payment",
+    "error log two",
+  );
+
+  const response = await request(app)
+    .get("/logs/aggregate")
+    .query({
+      since:
+        "2026-08-11T10:00:00.000Z",
+      until:
+        "2026-08-11T10:05:00.000Z",
+      bucket: "5m",
+      group_by: "level",
+    });
+
+  expect(response.status).toBe(200);
+
+  expect(response.body.buckets).toEqual([
+    {
+      start:
+        "2026-08-11T10:00:00.000Z",
+      group: "error",
+      count: 2,
+    },
+    {
+      start:
+        "2026-08-11T10:00:00.000Z",
+      group: "info",
+      count: 1,
+    },
+  ]);
+});
+
+test("returns an empty buckets array when no logs match", async () => {
+  const response = await request(app)
+    .get("/logs/aggregate")
+    .query({
+      since:
+        "2026-08-11T10:00:00.000Z",
+      until:
+        "2026-08-11T11:00:00.000Z",
+      bucket: "5m",
+    });
+
+  expect(response.status).toBe(200);
+
+  expect(response.body).toEqual({
+    buckets: [],
+  });
+});
+
+
   test("aggregates logs into time buckets", async () => {
     await seedLog(
       "2026-08-11T10:01:00.000Z",
@@ -119,6 +190,8 @@ describe("GET /logs/aggregate", () => {
         count: 1,
       },
     ]);
+
+    
   });
 
   test("groups aggregation by service", async () => {
