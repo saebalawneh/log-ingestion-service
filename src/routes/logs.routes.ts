@@ -10,6 +10,14 @@ import { getLogs } from "../services/query.service.js";
 import { ingestLogs } from "../services/ingestion.service.js";
 import { validateLogQuery } from "../validation/log-query-validation.js";
 
+import {
+  getLogAggregation,
+} from "../services/aggregate.service.js";
+
+import {
+  validateAggregateQuery,
+} from "../validation/aggregate-query-validation.js";
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return (
     typeof value === "object" &&
@@ -20,6 +28,43 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 export function createLogsRouter(pool: Pool): Router {
   const router = Router();
+
+  router.get(
+  "/logs/aggregate",
+  async (
+    request: Request,
+    response: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    try {
+      const validationResult =
+        validateAggregateQuery(
+          request.query as Record<
+            string,
+            unknown
+          >,
+        );
+
+      if (!validationResult.ok) {
+        response.status(400).json({
+          error: validationResult.error,
+        });
+
+        return;
+      }
+
+      const result =
+        await getLogAggregation(
+          pool,
+          validationResult.query,
+        );
+
+      response.status(200).json(result);
+    } catch (error: unknown) {
+      next(error);
+    }
+  },
+);
 
   router.post(
     "/logs",

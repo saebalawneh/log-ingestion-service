@@ -63,3 +63,51 @@ export type ValidationResult =
   message: string;
   attributes: LogAttributes;
 };
+
+
+export const AGGREGATE_BUCKETS = [
+  "1m",
+  "5m",
+  "1h",
+  "1d",
+] as const;
+
+export type AggregateBucket =
+  (typeof AGGREGATE_BUCKETS)[number];
+
+export const AGGREGATE_GROUPS = [
+  "service",
+  "level",
+] as const;
+
+export type AggregateGroupBy =
+  (typeof AGGREGATE_GROUPS)[number];
+
+export type AggregateQuery = {
+  since: string;
+  until: string;
+  bucket: AggregateBucket;
+  groupBy?: AggregateGroupBy;
+
+  service?: string;
+  level?: LogLevel;
+  q?: string;
+
+  attributes: Record<string, string>;
+};
+
+export type AggregateQueryValidationResult =
+  | {
+      ok: true;
+      query: AggregateQuery;
+    }
+  | {
+      ok: false;
+      error: string;
+    };
+
+export type AggregateBucketResult = {
+  start: string;
+  group: string | null;
+  count: number;
+};
