@@ -20,6 +20,9 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
+      RETENTION_DAYS: "${RETENTION_DAYS:-30}"
+      RETENTION_BATCH_SIZE: "${RETENTION_BATCH_SIZE:-1000}"
+      RETENTION_SWEEP_INTERVAL_MS: "${RETENTION_SWEEP_INTERVAL_MS:-60000}"
       NODE_ENV: production
       PORT: "8080"
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/logs_db
