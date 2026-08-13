@@ -12,6 +12,14 @@ import { Pool } from "pg";
 import { createApp } from "../../src/app.js";
 import { runMigrations } from "../../src/db/migrate.js";
 
+import {
+  insertLogs,
+} from "../../src/repositories/logs.repository.js";
+
+import type {
+  LogEntry,
+} from "../../src/types/logs.js";
+
 const aggregateTestPool = new Pool({
   connectionString:
     "postgresql://postgres:postgres@localhost:5433/logs_test_db",
@@ -22,34 +30,21 @@ const app = createApp(aggregateTestPool);
 
 async function seedLog(
   timestamp: string,
-  level: string,
+  level: LogEntry["level"],
   service: string,
   message: string,
-  attributes: Record<string, unknown> = {},
+  attributes: LogEntry["attributes"] = {},
 ): Promise<void> {
-  await aggregateTestPool.query(
-    `
-      INSERT INTO logs (
-        "timestamp",
+  await insertLogs(
+    aggregateTestPool,
+    [
+      {
+        timestamp,
         level,
         service,
         message,
-        attributes
-      )
-      VALUES (
-        $1::timestamptz,
-        $2,
-        $3,
-        $4,
-        $5::jsonb
-      )
-    `,
-    [
-      timestamp,
-      level,
-      service,
-      message,
-      JSON.stringify(attributes),
+        attributes,
+      },
     ],
   );
 }
@@ -61,9 +56,12 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  await aggregateTestPool.query(
-    "TRUNCATE TABLE logs RESTART IDENTITY",
-  );
+  await aggregateTestPool.query(`
+    TRUNCATE TABLE
+      logs,
+      log_rollups_1m
+    RESTART IDENTITY;
+  `);
 });
 
 afterAll(async () => {
@@ -191,7 +189,7 @@ test("returns an empty buckets array when no logs match", async () => {
       },
     ]);
 
-    
+
   });
 
   test("groups aggregation by service", async () => {
@@ -327,4 +325,349 @@ test("returns an empty buckets array when no logs match", async () => {
 
     expect(response.status).toBe(400);
   });
+
+  test("correctly combines raw boundary logs with full-minute rollups", async () => {
+  await seedLog(
+    "2026-08-11T10:00:10.000Z",
+    "info",
+    "api",
+    "before since",
+  );
+
+  await seedLog(
+    "2026-08-11T10:00:40.000Z",
+    "info",
+    "api",
+    "first partial minute",
+  );
+
+  await seedLog(
+    "2026-08-11T10:01:10.000Z",
+    "info",
+    "api",
+    "full minute one",
+  );
+
+  await seedLog(
+    "2026-08-11T10:02:10.000Z",
+    "info",
+    "api",
+    "full minute two",
+  );
+
+  await seedLog(
+    "2026-08-11T10:03:10.000Z",
+    "info",
+    "api",
+    "last partial minute",
+  );
+
+  await seedLog(
+    "2026-08-11T10:03:30.000Z",
+    "info",
+    "api",
+    "after until",
+  );
+
+  const response = await request(app)
+    .get("/logs/aggregate")
+    .query({
+      since:
+        "2026-08-11T10:00:30.000Z",
+      until:
+        "2026-08-11T10:03:20.000Z",
+      bucket: "5m",
+    });
+
+  expect(response.status).toBe(200);
+
+  expect(response.body.buckets).toEqual([
+    {
+      start:
+        "2026-08-11T10:00:00.000Z",
+      group: null,
+      count: 4,
+    },
+  ]);
+});
+
+test("uses raw logs when the entire range is inside one minute", async () => {
+  await seedLog(
+    "2026-08-11T10:00:05.000Z",
+    "info",
+    "api",
+    "before since",
+  );
+
+  await seedLog(
+    "2026-08-11T10:00:20.000Z",
+    "info",
+    "api",
+    "inside one",
+  );
+
+  await seedLog(
+    "2026-08-11T10:00:49.999Z",
+    "info",
+    "api",
+    "inside two",
+  );
+
+  await seedLog(
+    "2026-08-11T10:00:50.000Z",
+    "info",
+    "api",
+    "exact until",
+  );
+
+  const response = await request(app)
+    .get("/logs/aggregate")
+    .query({
+      since:
+        "2026-08-11T10:00:10.000Z",
+      until:
+        "2026-08-11T10:00:50.000Z",
+      bucket: "1m",
+    });
+
+  expect(response.status).toBe(200);
+
+  expect(response.body.buckets).toEqual([
+    {
+      start:
+        "2026-08-11T10:00:00.000Z",
+      group: null,
+      count: 2,
+    },
+  ]);
+});
+
+test("supports service and level filters on the rollup fast path", async () => {
+  await seedLog(
+    "2026-08-11T10:01:00.000Z",
+    "info",
+    "api",
+    "api info",
+  );
+
+  await seedLog(
+    "2026-08-11T10:02:00.000Z",
+    "error",
+    "api",
+    "api error",
+  );
+
+  await seedLog(
+    "2026-08-11T10:03:00.000Z",
+    "error",
+    "payment",
+    "payment error",
+  );
+
+  const response = await request(app)
+    .get("/logs/aggregate")
+    .query({
+      since:
+        "2026-08-11T10:00:00.000Z",
+      until:
+        "2026-08-11T10:05:00.000Z",
+      bucket: "5m",
+      service: "api",
+      level: "error",
+    });
+
+  expect(response.status).toBe(200);
+
+  expect(response.body.buckets).toEqual([
+    {
+      start:
+        "2026-08-11T10:00:00.000Z",
+      group: null,
+      count: 1,
+    },
+  ]);
+});
+
+test("rebins minute rollups into one-hour buckets", async () => {
+  await seedLog(
+    "2026-08-11T10:01:00.000Z",
+    "info",
+    "api",
+    "first",
+  );
+
+  await seedLog(
+    "2026-08-11T10:40:00.000Z",
+    "info",
+    "api",
+    "second",
+  );
+
+  await seedLog(
+    "2026-08-11T11:05:00.000Z",
+    "info",
+    "api",
+    "third",
+  );
+
+  const response = await request(app)
+    .get("/logs/aggregate")
+    .query({
+      since:
+        "2026-08-11T10:00:00.000Z",
+      until:
+        "2026-08-11T12:00:00.000Z",
+      bucket: "1h",
+    });
+
+  expect(response.status).toBe(200);
+
+  expect(response.body.buckets).toEqual([
+    {
+      start:
+        "2026-08-11T10:00:00.000Z",
+      group: null,
+      count: 2,
+    },
+    {
+      start:
+        "2026-08-11T11:00:00.000Z",
+      group: null,
+      count: 1,
+    },
+  ]);
+});
+
+test("rebins minute rollups into one-day buckets", async () => {
+  await seedLog(
+    "2026-08-11T01:00:00.000Z",
+    "info",
+    "api",
+    "day one first",
+  );
+
+  await seedLog(
+    "2026-08-11T22:00:00.000Z",
+    "error",
+    "api",
+    "day one second",
+  );
+
+  await seedLog(
+    "2026-08-12T05:00:00.000Z",
+    "info",
+    "api",
+    "day two",
+  );
+
+  const response = await request(app)
+    .get("/logs/aggregate")
+    .query({
+      since:
+        "2026-08-11T00:00:00.000Z",
+      until:
+        "2026-08-13T00:00:00.000Z",
+      bucket: "1d",
+    });
+
+  expect(response.status).toBe(200);
+
+  expect(response.body.buckets).toEqual([
+    {
+      start:
+        "2026-08-11T00:00:00.000Z",
+      group: null,
+      count: 2,
+    },
+    {
+      start:
+        "2026-08-12T00:00:00.000Z",
+      group: null,
+      count: 1,
+    },
+  ]);
+});
+
+test("falls back to raw aggregation when q is used", async () => {
+  await seedLog(
+    "2026-08-11T10:01:00.000Z",
+    "error",
+    "api",
+    "database timeout",
+  );
+
+  await seedLog(
+    "2026-08-11T10:02:00.000Z",
+    "error",
+    "api",
+    "connection refused",
+  );
+
+  const response = await request(app)
+    .get("/logs/aggregate")
+    .query({
+      since:
+        "2026-08-11T10:00:00.000Z",
+      until:
+        "2026-08-11T10:05:00.000Z",
+      bucket: "5m",
+      q: "timeout",
+    });
+
+  expect(response.status).toBe(200);
+
+  expect(response.body.buckets).toEqual([
+    {
+      start:
+        "2026-08-11T10:00:00.000Z",
+      group: null,
+      count: 1,
+    },
+  ]);
+});
+
+test("falls back to raw aggregation when an attribute filter is used", async () => {
+  await seedLog(
+    "2026-08-11T10:01:00.000Z",
+    "info",
+    "api",
+    "europe",
+    {
+      region: "eu-west",
+    },
+  );
+
+  await seedLog(
+    "2026-08-11T10:02:00.000Z",
+    "info",
+    "api",
+    "america",
+    {
+      region: "us-east",
+    },
+  );
+
+  const response = await request(app)
+    .get("/logs/aggregate")
+    .query({
+      since:
+        "2026-08-11T10:00:00.000Z",
+      until:
+        "2026-08-11T10:05:00.000Z",
+      bucket: "5m",
+      "attr.region": "eu-west",
+    });
+
+  expect(response.status).toBe(200);
+
+  expect(response.body.buckets).toEqual([
+    {
+      start:
+        "2026-08-11T10:00:00.000Z",
+      group: null,
+      count: 1,
+    },
+  ]);
+});
+
 });

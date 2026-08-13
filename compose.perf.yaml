@@ -1,0 +1,63 @@
+name: log-ingestion-perf
+
+services:
+  postgres-perf:
+    image: postgres:17-alpine
+
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: logs_perf_db
+    volumes:
+      - postgres_perf_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U postgres -d logs_perf_db"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    cpus: "1.0"
+    mem_limit: 1g
+
+  app-perf:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      DATABASE_URL: postgresql://postgres:postgres@postgres-perf:5432/logs_perf_db
+
+      RETENTION_DAYS: "30"
+      RETENTION_BATCH_SIZE: "1000"
+      RETENTION_SWEEP_INTERVAL_MS: "60000"
+
+    ports:
+      - "8081:8080"
+
+    depends_on:
+      postgres-perf:
+        condition: service_healthy
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:8080/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+    cpus: "0.5"
+    mem_limit: 256m
+
+volumes:
+  postgres_perf_data:

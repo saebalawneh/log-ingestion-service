@@ -1,4 +1,8 @@
-import type { Pool, PoolClient } from "pg";
+import type {
+  Pool,
+  PoolClient,
+} from "pg";
+
 import type {
   LogEntry,
   LogQuery,
@@ -6,7 +10,98 @@ import type {
 } from "../types/logs.js";
 
 const INSERT_CHUNK_SIZE = 1000;
+const ROLLUP_CHUNK_SIZE = 1000;
 
+type RollupRow = {
+  bucketStart: string;
+  service: string;
+  level: string;
+  count: number;
+};
+
+function getMinuteBucket(
+  timestamp: string,
+): string {
+  const milliseconds =
+    new Date(timestamp).getTime();
+
+  const minuteStart =
+    Math.floor(
+      milliseconds / 60_000,
+    ) * 60_000;
+
+  return new Date(
+    minuteStart,
+  ).toISOString();
+}
+
+function buildRollupRows(
+  logs: LogEntry[],
+): RollupRow[] {
+  const counts =
+    new Map<string, RollupRow>();
+
+  for (const log of logs) {
+    const bucketStart =
+      getMinuteBucket(
+        log.timestamp,
+      );
+
+    const key = JSON.stringify([
+      bucketStart,
+      log.service,
+      log.level,
+    ]);
+
+    const existing =
+      counts.get(key);
+
+    if (existing !== undefined) {
+      existing.count += 1;
+      continue;
+    }
+
+    counts.set(key, {
+      bucketStart,
+      service: log.service,
+      level: log.level,
+      count: 1,
+    });
+  }
+
+  const rows =
+    [...counts.values()];
+
+  rows.sort((a, b) => {
+    if (a.bucketStart < b.bucketStart) {
+      return -1;
+    }
+
+    if (a.bucketStart > b.bucketStart) {
+      return 1;
+    }
+
+    if (a.service < b.service) {
+      return -1;
+    }
+
+    if (a.service > b.service) {
+      return 1;
+    }
+
+    if (a.level < b.level) {
+      return -1;
+    }
+
+    if (a.level > b.level) {
+      return 1;
+    }
+
+    return 0;
+  });
+
+  return rows;
+}
 async function insertChunk(
   client: PoolClient,
   logs: LogEntry[],
@@ -17,25 +112,28 @@ async function insertChunk(
 
   const values: unknown[] = [];
 
-  const placeholders = logs.map((log, index) => {
-    const base = index * 5;
+  const placeholders =
+    logs.map((log, index) => {
+      const base = index * 5;
 
-    values.push(
-      log.timestamp,
-      log.level,
-      log.service,
-      log.message,
-      JSON.stringify(log.attributes),
-    );
+      values.push(
+        log.timestamp,
+        log.level,
+        log.service,
+        log.message,
+        JSON.stringify(
+          log.attributes,
+        ),
+      );
 
-    return `(
-      $${base + 1}::timestamptz,
-      $${base + 2},
-      $${base + 3},
-      $${base + 4},
-      $${base + 5}::jsonb
-    )`;
-  });
+      return `(
+        $${base + 1}::timestamptz,
+        $${base + 2},
+        $${base + 3},
+        $${base + 4},
+        $${base + 5}::jsonb
+      )`;
+    });
 
   const query = `
     INSERT INTO logs (
@@ -48,7 +146,64 @@ async function insertChunk(
     VALUES ${placeholders.join(",")}
   `;
 
-  await client.query(query, values);
+  await client.query(
+    query,
+    values,
+  );
+}
+
+async function upsertRollupChunk(
+  client: PoolClient,
+  rows: RollupRow[],
+): Promise<void> {
+  if (rows.length === 0) {
+    return;
+  }
+
+  const values: unknown[] = [];
+
+  const placeholders =
+    rows.map((row, index) => {
+      const base = index * 4;
+
+      values.push(
+        row.bucketStart,
+        row.service,
+        row.level,
+        row.count,
+      );
+
+      return `(
+        $${base + 1}::timestamptz,
+        $${base + 2},
+        $${base + 3},
+        $${base + 4}::bigint
+      )`;
+    });
+
+  const query = `
+    INSERT INTO log_rollups_1m (
+      bucket_start,
+      service,
+      level,
+      count
+    )
+    VALUES ${placeholders.join(",")}
+    ON CONFLICT (
+      bucket_start,
+      service,
+      level
+    )
+    DO UPDATE
+    SET count =
+      log_rollups_1m.count +
+      EXCLUDED.count
+  `;
+
+  await client.query(
+    query,
+    values,
+  );
 }
 
 export async function insertLogs(
@@ -59,26 +214,58 @@ export async function insertLogs(
     return;
   }
 
-  const client = await pool.connect();
+  const rollupRows =
+    buildRollupRows(logs);
+
+  const client =
+    await pool.connect();
 
   try {
     await client.query("BEGIN");
 
-    for (let start = 0; start < logs.length; start += INSERT_CHUNK_SIZE) {
-      const chunk = logs.slice(start, start + INSERT_CHUNK_SIZE);
+    for (
+      let start = 0;
+      start < logs.length;
+      start += INSERT_CHUNK_SIZE
+    ) {
+      const chunk = logs.slice(
+        start,
+        start + INSERT_CHUNK_SIZE,
+      );
 
-      await insertChunk(client, chunk);
+      await insertChunk(
+        client,
+        chunk,
+      );
+    }
+
+    for (
+      let start = 0;
+      start < rollupRows.length;
+      start += ROLLUP_CHUNK_SIZE
+    ) {
+      const chunk =
+        rollupRows.slice(
+          start,
+          start +
+            ROLLUP_CHUNK_SIZE,
+        );
+
+      await upsertRollupChunk(
+        client,
+        chunk,
+      );
     }
 
     await client.query("COMMIT");
   } catch (error: unknown) {
     await client.query("ROLLBACK");
+
     throw error;
   } finally {
     client.release();
   }
 }
-
 
 export async function findLogs(
   pool: Pool,
@@ -119,14 +306,19 @@ export async function findLogs(
     );
   }
 
-  for (const [key, value] of Object.entries(query.attributes)) {
+  for (
+    const [key, value] of
+    Object.entries(query.attributes)
+  ) {
     values.push(key);
 
-    const keyPlaceholder = `$${values.length}`;
+    const keyPlaceholder =
+      `$${values.length}`;
 
     values.push(value);
 
-    const valuePlaceholder = `$${values.length}`;
+    const valuePlaceholder =
+      `$${values.length}`;
 
     conditions.push(
       `attributes ->> ${keyPlaceholder}::text = ${valuePlaceholder}`,
@@ -141,32 +333,43 @@ export async function findLogs(
     );
   }
 
-if (query.cursor !== undefined) {
-  values.push(query.cursor.timestamp);
-  const timestampPlaceholder = `$${values.length}`;
+  if (query.cursor !== undefined) {
+    values.push(
+      query.cursor.timestamp,
+    );
 
-  values.push(query.cursor.id);
-  const idPlaceholder = `$${values.length}`;
+    const timestampPlaceholder =
+      `$${values.length}`;
 
-  conditions.push(`
-    (
-      "timestamp" < ${timestampPlaceholder}::timestamptz
-      OR (
-        "timestamp" = ${timestampPlaceholder}::timestamptz
-        AND id < ${idPlaceholder}::bigint
+    values.push(
+      query.cursor.id,
+    );
+
+    const idPlaceholder =
+      `$${values.length}`;
+
+    conditions.push(`
+      (
+        "timestamp" < ${timestampPlaceholder}::timestamptz
+        OR (
+          "timestamp" = ${timestampPlaceholder}::timestamptz
+          AND id < ${idPlaceholder}::bigint
+        )
       )
-    )
-  `);
-}
+    `);
+  }
 
   const whereClause =
     conditions.length > 0
       ? `WHERE ${conditions.join(" AND ")}`
       : "";
 
-values.push(query.limit + 1);
+  values.push(
+    query.limit + 1,
+  );
 
-  const limitPlaceholder = `$${values.length}`;
+  const limitPlaceholder =
+    `$${values.length}`;
 
   const sql = `
     SELECT
@@ -182,11 +385,11 @@ values.push(query.limit + 1);
     LIMIT ${limitPlaceholder}
   `;
 
-  const result = await pool.query<StoredLog>(
-    sql,
-    values,
-  );
+  const result =
+    await pool.query<StoredLog>(
+      sql,
+      values,
+    );
 
   return result.rows;
 }
-
