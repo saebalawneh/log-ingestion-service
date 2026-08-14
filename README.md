@@ -1691,7 +1691,7 @@ The main design goals of the project are:
    - PostgreSQL as the durable source of truth
    - automatic migrations
    - health checks
-   - graceful shutdown
+   - graceful shutdown that waits for any active retention sweep before closing HTTP and PostgreSQL connections
    - rollback on inconsistent operations
 
 4. **Maintainability**
