@@ -20,6 +20,15 @@ function getSingleQueryValue(
     : undefined;
 }
 
+function hasInvalidSingleValue(
+  value: unknown,
+): boolean {
+  return (
+    value !== undefined &&
+    typeof value !== "string"
+  );
+}
+
 function isValidDateTime(value: string): boolean {
   return (
     ISO_8601_DATE_TIME.test(value) &&
@@ -54,6 +63,28 @@ function isAggregateGroupBy(
 export function validateAggregateQuery(
   input: Record<string, unknown>,
 ): AggregateQueryValidationResult {
+    const singleValueParameters = [
+    "since",
+    "until",
+    "bucket",
+    "group_by",
+    "service",
+    "level",
+    "q",
+  ] as const;
+
+  for (const parameter of singleValueParameters) {
+    if (
+      hasInvalidSingleValue(
+        input[parameter],
+      )
+    ) {
+      return {
+        ok: false,
+        error: `${parameter} must be provided once`,
+      };
+    }
+  }
   const since = getSingleQueryValue(input.since);
   const until = getSingleQueryValue(input.until);
   const bucket = getSingleQueryValue(input.bucket);

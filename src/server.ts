@@ -1,4 +1,7 @@
-import { createServer, type Server } from "node:http";
+import {
+  createServer,
+  type Server,
+} from "node:http";
 
 import { createApp } from "./app.js";
 import { env } from "./config/env.js";
@@ -11,14 +14,16 @@ import {
 let server: Server | undefined;
 
 let stopRetentionWorker:
-  | (() => void)
+  | (() => Promise<void>)
   | undefined;
 
 let isShuttingDown = false;
 
 async function startServer(): Promise<void> {
   try {
-    console.log("Connecting to PostgreSQL...");
+    console.log(
+      "Connecting to PostgreSQL...",
+    );
 
     await pool.query("SELECT 1");
 
@@ -30,7 +35,8 @@ async function startServer(): Promise<void> {
 
     const app = createApp(pool);
 
-    const httpServer = createServer(app);
+    const httpServer =
+      createServer(app);
 
     server = httpServer;
 
@@ -47,14 +53,15 @@ async function startServer(): Promise<void> {
           reject(error);
         };
 
-        const handleListening = (): void => {
-          httpServer.off(
-            "error",
-            handleError,
-          );
+        const handleListening =
+          (): void => {
+            httpServer.off(
+              "error",
+              handleError,
+            );
 
-          resolve();
-        };
+            resolve();
+          };
 
         httpServer.once(
           "error",
@@ -89,7 +96,14 @@ async function startServer(): Promise<void> {
       error,
     );
 
-    stopRetentionWorker?.();
+    if (
+      stopRetentionWorker !== undefined
+    ) {
+      await stopRetentionWorker();
+
+      stopRetentionWorker =
+        undefined;
+    }
 
     try {
       await pool.end();
@@ -133,9 +147,13 @@ async function shutdown(
     if (
       stopRetentionWorker !== undefined
     ) {
-      stopRetentionWorker();
+      const stopWorker =
+        stopRetentionWorker;
 
-      stopRetentionWorker = undefined;
+      stopRetentionWorker =
+        undefined;
+
+      await stopWorker();
 
       console.log(
         "Retention worker stopped",
@@ -193,12 +211,18 @@ async function shutdown(
   }
 }
 
-process.on("SIGTERM", () => {
-  void shutdown("SIGTERM");
-});
+process.on(
+  "SIGTERM",
+  () => {
+    void shutdown("SIGTERM");
+  },
+);
 
-process.on("SIGINT", () => {
-  void shutdown("SIGINT");
-});
+process.on(
+  "SIGINT",
+  () => {
+    void shutdown("SIGINT");
+  },
+);
 
 void startServer();

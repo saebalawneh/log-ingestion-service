@@ -669,5 +669,19 @@ test("falls back to raw aggregation when an attribute filter is used", async () 
     },
   ]);
 });
+test("returns 400 for repeated scalar aggregate parameters", async () => {
+  const response = await request(app).get(
+    "/logs/aggregate" +
+      "?since=2026-08-11T10%3A00%3A00.000Z" +
+      "&until=2026-08-11T11%3A00%3A00.000Z" +
+      "&bucket=1m" +
+      "&bucket=5m",
+  );
 
+  expect(response.status).toBe(400);
+
+  expect(response.body).toEqual({
+    error: "bucket must be provided once",
+  });
+});
 });

@@ -7,11 +7,15 @@ import {
 
 export function startRetentionWorker(
   pool: Pool,
-): () => void {
+): () => Promise<void> {
   let stopped = false;
 
   let timer:
     | NodeJS.Timeout
+    | undefined;
+
+  let activeRun:
+    | Promise<void>
     | undefined;
 
   async function run(): Promise<void> {
@@ -42,7 +46,7 @@ export function startRetentionWorker(
       if (!stopped) {
         timer = setTimeout(
           () => {
-            void run();
+            activeRun = run();
           },
           env.retentionSweepIntervalMs,
         );
@@ -50,13 +54,18 @@ export function startRetentionWorker(
     }
   }
 
-  void run();
+  activeRun = run();
 
-  return () => {
+  return async (): Promise<void> => {
     stopped = true;
 
     if (timer !== undefined) {
       clearTimeout(timer);
+      timer = undefined;
+    }
+
+    if (activeRun !== undefined) {
+      await activeRun;
     }
   };
 }

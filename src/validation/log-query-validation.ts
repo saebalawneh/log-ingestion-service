@@ -12,7 +12,9 @@ const ISO_8601_DATE_TIME =
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1000;
 
-function getSingleQueryValue(value: unknown): string | undefined {
+function getSingleQueryValue(
+  value: unknown,
+): string | undefined {
   if (typeof value === "string") {
     return value;
   }
@@ -20,18 +22,37 @@ function getSingleQueryValue(value: unknown): string | undefined {
   return undefined;
 }
 
-function isLogLevel(value: string): value is LogLevel {
-  return (LOG_LEVELS as readonly string[]).includes(value);
+function hasInvalidSingleValue(
+  value: unknown,
+): boolean {
+  return (
+    value !== undefined &&
+    typeof value !== "string"
+  );
 }
 
-function parseLimit(value: unknown): number | undefined {
+function isLogLevel(
+  value: string,
+): value is LogLevel {
+  return (
+    LOG_LEVELS as readonly string[]
+  ).includes(value);
+}
+
+function parseLimit(
+  value: unknown,
+): number | undefined {
   if (value === undefined) {
     return DEFAULT_LIMIT;
   }
 
-  const rawValue = getSingleQueryValue(value);
+  const rawValue =
+    getSingleQueryValue(value);
 
-  if (rawValue === undefined || rawValue.trim() === "") {
+  if (
+    rawValue === undefined ||
+    rawValue.trim() === ""
+  ) {
     return undefined;
   }
 
@@ -48,7 +69,9 @@ function parseLimit(value: unknown): number | undefined {
   return limit;
 }
 
-function isValidDateTime(value: string): boolean {
+function isValidDateTime(
+  value: string,
+): boolean {
   return (
     ISO_8601_DATE_TIME.test(value) &&
     Number.isFinite(Date.parse(value))
@@ -58,99 +81,169 @@ function isValidDateTime(value: string): boolean {
 export function validateLogQuery(
   input: Record<string, unknown>,
 ): LogQueryValidationResult {
-    const cursorValue = getSingleQueryValue(input.cursor);
-  const service = getSingleQueryValue(input.service);
-  const level = getSingleQueryValue(input.level);
-  const since = getSingleQueryValue(input.since);
-  const until = getSingleQueryValue(input.until);
-  const q = getSingleQueryValue(input.q);
+  const singleValueParameters = [
+    "cursor",
+    "service",
+    "level",
+    "since",
+    "until",
+    "q",
+    "limit",
+  ] as const;
 
-  const limit = parseLimit(input.limit);
-
-  if (input.limit !== undefined && limit === undefined) {
-    return {
-      ok: false,
-      error: "limit must be an integer between 1 and 1000",
-    };
-  }
-if (
-  input.cursor !== undefined &&
-  cursorValue === undefined
-) {
-  return {
-    ok: false,
-    error: "invalid cursor",
-  };
-}
-const cursor =
-  cursorValue === undefined
-    ? undefined
-    : decodeLogCursor(cursorValue);
-    if (cursor === null) {
-  return {
-    ok: false,
-    error: "invalid cursor",
-  };
-}
-
-  if (level !== undefined && !isLogLevel(level)) {
-    return {
-      ok: false,
-      error: "level must be debug, info, warn, or error",
-    };
+  for (
+    const parameter
+    of singleValueParameters
+  ) {
+    if (
+      hasInvalidSingleValue(
+        input[parameter],
+      )
+    ) {
+      return {
+        ok: false,
+        error: `${parameter} must be provided once`,
+      };
+    }
   }
 
-  if (since !== undefined && !isValidDateTime(since)) {
+  const cursorValue =
+    getSingleQueryValue(input.cursor);
+
+  const service =
+    getSingleQueryValue(input.service);
+
+  const level =
+    getSingleQueryValue(input.level);
+
+  const since =
+    getSingleQueryValue(input.since);
+
+  const until =
+    getSingleQueryValue(input.until);
+
+  const q =
+    getSingleQueryValue(input.q);
+
+  const limit =
+    parseLimit(input.limit);
+
+  if (
+    input.limit !== undefined &&
+    limit === undefined
+  ) {
     return {
       ok: false,
-      error: "since must be a valid date-time",
+      error:
+        "limit must be an integer between 1 and 1000",
     };
   }
 
-  if (until !== undefined && !isValidDateTime(until)) {
+  if (
+    input.cursor !== undefined &&
+    cursorValue === undefined
+  ) {
     return {
       ok: false,
-      error: "until must be a valid date-time",
+      error: "invalid cursor",
+    };
+  }
+
+  const cursor =
+    cursorValue === undefined
+      ? undefined
+      : decodeLogCursor(cursorValue);
+
+  if (cursor === null) {
+    return {
+      ok: false,
+      error: "invalid cursor",
+    };
+  }
+
+  if (
+    level !== undefined &&
+    !isLogLevel(level)
+  ) {
+    return {
+      ok: false,
+      error:
+        "level must be debug, info, warn, or error",
+    };
+  }
+
+  if (
+    since !== undefined &&
+    !isValidDateTime(since)
+  ) {
+    return {
+      ok: false,
+      error:
+        "since must be a valid date-time",
+    };
+  }
+
+  if (
+    until !== undefined &&
+    !isValidDateTime(until)
+  ) {
+    return {
+      ok: false,
+      error:
+        "until must be a valid date-time",
     };
   }
 
   if (
     since !== undefined &&
     until !== undefined &&
-    Date.parse(until) < Date.parse(since)
+    Date.parse(until) <
+      Date.parse(since)
   ) {
     return {
       ok: false,
-      error: "until cannot be earlier than since",
+      error:
+        "until cannot be earlier than since",
     };
   }
 
-  const attributes: Record<string, string> = {};
+  const attributes:
+    Record<string, string> = {};
 
-  for (const [key, value] of Object.entries(input)) {
+  for (
+    const [key, value]
+    of Object.entries(input)
+  ) {
     if (!key.startsWith("attr.")) {
       continue;
     }
 
-    const attributeName = key.slice("attr.".length);
+    const attributeName =
+      key.slice("attr.".length);
 
     if (attributeName.length === 0) {
       return {
         ok: false,
-        error: "attribute filter must include a key",
+        error:
+          "attribute filter must include a key",
       };
     }
 
-    const attributeValue = getSingleQueryValue(value);
+    const attributeValue =
+      getSingleQueryValue(value);
 
-    if (attributeValue === undefined) {
+    if (
+      attributeValue === undefined
+    ) {
       return {
         ok: false,
-        error: `invalid value for attribute '${attributeName}'`,
+        error:
+          `invalid value for attribute '${attributeName}'`,
       };
     }
 
-    attributes[attributeName] = attributeValue;
+    attributes[attributeName] =
+      attributeValue;
   }
 
   const query: LogQuery = {
@@ -177,9 +270,14 @@ const cursor =
   if (q !== undefined) {
     query.q = q;
   }
-if (cursor !== undefined && cursor !== null) {
-  query.cursor = cursor;
-}
+
+  if (
+    cursor !== undefined &&
+    cursor !== null
+  ) {
+    query.cursor = cursor;
+  }
+
   return {
     ok: true,
     query,

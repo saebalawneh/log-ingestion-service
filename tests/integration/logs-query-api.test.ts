@@ -347,4 +347,15 @@ describe("GET /logs", () => {
       error: "invalid cursor",
     });
   });
+  test("returns 400 for repeated scalar query parameters", async () => {
+  const response = await request(app).get(
+    "/logs?service=api&service=auth",
+  );
+
+  expect(response.status).toBe(400);
+
+  expect(response.body).toEqual({
+    error: "service must be provided once",
+  });
+});
 });

@@ -174,4 +174,39 @@ test("rejects a non-ISO date even if Date.parse could understand it", () => {
       limit: 50,
     });
   });
+  test.each([
+  "cursor",
+  "service",
+  "level",
+  "since",
+  "until",
+  "q",
+  "limit",
+])(
+  "rejects repeated %s parameters",
+  (parameter) => {
+    const result = validateLogQuery({
+      [parameter]: ["first", "second"],
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      error: `${parameter} must be provided once`,
+    });
+  },
+);
+
+test("rejects repeated values for the same attribute filter", () => {
+  const result = validateLogQuery({
+    "attr.region": [
+      "eu-west",
+      "us-east",
+    ],
+  });
+
+  expect(result).toEqual({
+    ok: false,
+    error: "invalid value for attribute 'region'",
+  });
+});
 });

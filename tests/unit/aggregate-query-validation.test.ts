@@ -106,4 +106,42 @@ describe("validateAggregateQuery", () => {
       });
     }
   });
+  test.each([
+  "since",
+  "until",
+  "bucket",
+  "group_by",
+  "service",
+  "level",
+  "q",
+])(
+  "rejects repeated %s parameters",
+  (parameter) => {
+    const result = validateAggregateQuery({
+      [parameter]: ["first", "second"],
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      error: `${parameter} must be provided once`,
+    });
+  },
+);
+
+test("rejects repeated values for the same attribute filter", () => {
+  const result = validateAggregateQuery({
+    since: "2026-08-11T10:00:00.000Z",
+    until: "2026-08-11T11:00:00.000Z",
+    bucket: "5m",
+    "attr.region": [
+      "eu-west",
+      "us-east",
+    ],
+  });
+
+  expect(result).toEqual({
+    ok: false,
+    error: "invalid value for attribute 'region'",
+  });
+});
 });
