@@ -1,7 +1,15 @@
 import type { Pool } from "pg";
-import { insertLogs } from "../repositories/logs.repository.js";
-import type { LogEntry, RejectedLog } from "../types/logs.js";
-import { validateLog } from "../validation/log-validation.js";
+
+import {
+  enqueueLogWrite,
+} from "./ingestion-write-coordinator.js";
+import type {
+  LogEntry,
+  RejectedLog,
+} from "../types/logs.js";
+import {
+  validateLog,
+} from "../validation/log-validation.js";
 
 export type IngestionResult = {
   accepted: number;
@@ -17,18 +25,33 @@ export async function ingestLogs(
 
   const nowMs = Date.now();
 
-  for (const [index, input] of inputs.entries()) {
-    const result = validateLog(input, index, nowMs);
+  for (
+    const [index, input]
+    of inputs.entries()
+  ) {
+    const result =
+      validateLog(
+        input,
+        index,
+        nowMs,
+      );
 
     if (result.ok) {
-      validLogs.push(result.log);
+      validLogs.push(
+        result.log,
+      );
     } else {
-      rejected.push(result.rejection);
+      rejected.push(
+        result.rejection,
+      );
     }
   }
 
   if (validLogs.length > 0) {
-    await insertLogs(pool, validLogs);
+    await enqueueLogWrite(
+      pool,
+      validLogs,
+    );
   }
 
   return {
