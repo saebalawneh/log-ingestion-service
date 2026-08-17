@@ -206,6 +206,108 @@ async function upsertRollupChunk(
   );
 }
 
+async function insertLogsAndRollups(
+  pool: Pool,
+  logs: LogEntry[],
+  rollupRows: RollupRow[],
+): Promise<void> {
+  const values: unknown[] = [];
+
+  const logPlaceholders =
+    logs.map((log) => {
+      const base = values.length;
+
+      values.push(
+        log.timestamp,
+        log.level,
+        log.service,
+        log.message,
+        JSON.stringify(
+          log.attributes,
+        ),
+      );
+
+      return `(
+        $${base + 1}::timestamptz,
+        $${base + 2},
+        $${base + 3},
+        $${base + 4},
+        $${base + 5}::jsonb
+      )`;
+    });
+
+  const rollupPlaceholders =
+    rollupRows.map((row) => {
+      const base = values.length;
+
+      values.push(
+        row.bucketStart,
+        row.service,
+        row.level,
+        row.count,
+      );
+
+      return `(
+        $${base + 1}::timestamptz,
+        $${base + 2},
+        $${base + 3},
+        $${base + 4}::bigint
+      )`;
+    });
+
+  const query = `
+    WITH inserted_logs AS (
+      INSERT INTO logs (
+        "timestamp",
+        level,
+        service,
+        message,
+        attributes
+      )
+      VALUES
+        ${logPlaceholders.join(",")}
+      RETURNING id
+    ),
+
+    updated_rollups AS (
+      INSERT INTO log_rollups_1m (
+        bucket_start,
+        service,
+        level,
+        count
+      )
+      VALUES
+        ${rollupPlaceholders.join(",")}
+
+      ON CONFLICT (
+        bucket_start,
+        service,
+        level
+      )
+      DO UPDATE
+      SET count =
+        log_rollups_1m.count +
+        EXCLUDED.count
+
+      RETURNING bucket_start
+    )
+
+    SELECT
+      (SELECT COUNT(*)
+       FROM inserted_logs)
+        AS inserted_count,
+
+      (SELECT COUNT(*)
+       FROM updated_rollups)
+        AS rollup_count
+  `;
+
+  await pool.query(
+    query,
+    values,
+  );
+}
+
 export async function insertLogs(
   pool: Pool,
   logs: LogEntry[],
@@ -217,6 +319,20 @@ export async function insertLogs(
   const rollupRows =
     buildRollupRows(logs);
 
+    if (
+    logs.length <= INSERT_CHUNK_SIZE &&
+    rollupRows.length <=
+      ROLLUP_CHUNK_SIZE
+  ) {
+    await insertLogsAndRollups(
+      pool,
+      logs,
+      rollupRows,
+    );
+
+    return;
+  }
+  
   const client =
     await pool.connect();
 
