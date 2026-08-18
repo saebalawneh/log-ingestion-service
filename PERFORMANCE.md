@@ -541,8 +541,9 @@ data set, common aggregate requests operate primarily on a very small
 set of pre-aggregated rows.
 
 The 0.159 ms result represents the database execution of the isolated
-rollup query, not the end-to-end HTTP aggregate latency. The final
-mixed-load benchmark measured an aggregate endpoint p95 of 773.66 ms.
+rollup query, not the end-to-end HTTP aggregate latency. After the final
+raw-boundary optimization, three consecutive full benchmark runs
+ measured aggregate endpoint p95 latency between 65 ms and 75 ms.
 
 # Rollup Migration and Backfill
 
@@ -588,12 +589,49 @@ This prevents silent divergence between raw logs and aggregate data.
 
 ---
 
+# Final Raw Boundary Optimization
+
+After profiling the rollup-based aggregation path, the rollup lookup itself
+was found to be extremely fast. A representative isolated rollup query
+completed in approximately 0.267 ms.
+
+The remaining bottleneck was the raw partial-minute boundary query.
+
+The original implementation scanned the complete requested time range and
+then excluded the fully covered minutes using an `OR` condition.
+
+The boundary path was changed into three explicit and mutually exclusive
+timestamp ranges:
+
+1. The complete requested range when no full minute exists.
+2. The partial range from `since` to `full_start`.
+3. The partial range from `full_end` to `until`.
+
+These ranges are combined using `UNION ALL`.
+
+This allows PostgreSQL to perform narrow timestamp-range scans instead of
+examining the complete active range and filtering the boundary rows afterward.
+
+The optimization preserves:
+
+- inclusive `since`
+- exclusive `until`
+- service filtering
+- level filtering
+- grouping semantics
+- raw/rollup consistency
+
+Three consecutive full benchmark runs confirmed a large reduction in
+aggregate latency without reducing correctness or reliability.
+
+---
+
 # Correctness Verification
 
 The final automated test suite contains:
 
-- 7 test files
-- 68 passing tests
+- 9 test files
+- 92 passing tests
 
 Coverage includes:
 
@@ -616,61 +654,50 @@ Coverage includes:
 - zero-count rollup cleanup
 - retention rollback on inconsistency
 - raw/rollup consistency after retention
+- repeated scalar query-parameter rejection
+- ingestion micro-batching
+- durability of coalesced writes
+- database failure propagation for coalesced writes
+- maximum micro-batch sizing
+- retention-worker shutdown synchronization
 
 ---
 
-# Final Mixed-Load Benchmark
+# Final Foothill Benchmark
 
-Configuration:
+The final implementation was tested using the provided Foothill benchmark CLI:
 
-- Duration: 60 seconds
-- Ingestion concurrency: 4
-- Batch size: 2,000
-- Query interval: 250 ms
-- Aggregate interval: 1 second
-
-Results:
-
-- Attempted logs: 1,858,000
-- Accepted logs: 1,858,000
-- Rejected logs: 0
-- Ingestion errors: 0
-- Throughput: 30,958.22 logs/sec
-- Ingestion p95: 399.56 ms
-- Query requests: 239
-- Query errors: 0
-- Query p95: 158.88 ms
-- Aggregate requests: 60
-- Aggregate errors: 0
-- Aggregate p95: 773.66 ms
-- Visibility latency: 978.90 ms
-
-After the visibility test:
-
-- Raw log count: 1,858,001
-- Rollup count total: 1,858,001
-
-No application errors or PostgreSQL deadlocks were observed.
+```bash
+npx --yes github:Ahmad-Abbas-Foothill/logs-benchmark-cli \
+  --compose ./compose.yaml \
+  --full \
+  --seed 6122026 \
+  --runner docker \
+  --generator-cpus 4
 ---
 
 # Requirement Results
 
-| Requirement | Result |
-| --- | --- |
-| Ingestion >= 15,000 logs/sec | PASS - 30,958.22 logs/sec |
-| Zero rejected valid logs | PASS - 0 rejected |
-| Zero ingestion errors | PASS - 0 errors |
-| Zero query errors | PASS - 0 errors |
-| Zero aggregate errors | PASS - 0 errors |
-| All attempted logs accepted | PASS - 1,858,000 / 1,858,000 |
-| Aggregate p95 < 1 second | PASS - 773.66 ms |
-| Newly ingested logs visible < 20 seconds | PASS - 978.90 ms |
-| Application <= 0.5 CPU / 256 MB | PASS - Docker limit enforced |
-| PostgreSQL <= 1 CPU / 1 GB | PASS - Docker limit enforced |
+# Requirement Results
 
-The measured ingestion throughput was slightly more than twice the
-required minimum while aggregate latency remained below one second.
+| Requirement | Final measured result | Status |
+| --- | --- | --- |
+| Correct API behavior | `15/15` Foothill correctness checks | PASS |
+| Zero rejected valid logs | No valid-load rejections observed | PASS |
+| Zero ingestion errors | `0%` in all final benchmark runs | PASS |
+| Ingestion target | `14,866–14,999 logs/sec` in final Foothill runs | ENVIRONMENT DEPENDENT |
+| Aggregate p95 < 1 second | `65–75 ms` | PASS |
+| Eventual consistency | `4/4` scenarios | PASS |
+| Reliability | `20/20` | PASS |
+| Application <= 0.5 CPU / 256 MB | Benchmark limit enforced | PASS |
+| PostgreSQL <= 1 CPU / 1 GB | Benchmark limit enforced | PASS |
 
+Dedicated local ingestion tests also exceeded the `15,000 logs/sec`
+requirement.
+
+The final Foothill runs were performed on a machine measured at approximately
+`0.55x` of the reference machine, and the CLI reported generator limitations
+during some scenarios.
 ---
 
 # Bottlenecks and Tradeoffs
@@ -721,31 +748,52 @@ requirements.
 
 # Conclusion
 
-The original raw aggregation approach caused PostgreSQL CPU contention
-and could not consistently satisfy the aggregate p95 requirement during
-heavy ingestion.
+# Conclusion
 
-Testing showed that concurrency tuning, PostgreSQL parallelism changes,
-and a covering index were not sufficient.
+The original raw aggregation approach caused significant PostgreSQL CPU
+contention during concurrent high-volume ingestion.
 
-A one-minute rollup table with atomic ingestion updates and a hybrid
-raw/rollup aggregation strategy resolved the bottleneck while preserving
-exact query semantics.
+Performance investigation included:
 
-The final mixed workload achieved:
+- query-plan analysis
+- ingestion isolation tests
+- aggregation isolation tests
+- concurrency tuning
+- PostgreSQL parallelism experiments
+- covering-index experiments
+- minute rollups
+- atomic raw/rollup writes
+- deterministic rollup lock ordering
+- reduced database round trips
+- ingestion micro-batching
+- raw aggregate boundary optimization
 
-The final mixed workload achieved:
+Several optimizations were intentionally rejected when they improved an
+isolated query but made the complete workload worse.
 
-- 30,958.22 logs/sec
-- 0 rejected logs
-- 0 ingestion errors
-- 0 query errors
-- 0 aggregate errors
-- 158.88 ms query p95
-- 773.66 ms aggregate p95
-- 978.90 ms visibility latency
+The final implementation combines:
 
-under the required Docker CPU and memory limits.
+- PostgreSQL as the durable source of truth
+- one-minute aggregation rollups
+- exact raw handling for partial time boundaries
+- narrow index-friendly boundary ranges
+- raw fallback for unsupported rollup filters
+- ingestion micro-batching
+- atomic raw and rollup updates
+- keyset pagination
+- transactional retention
 
-The optimized implementation therefore satisfies the measured core
-performance requirements.
+Three consecutive final Foothill benchmark runs produced:
+
+- `14,866–14,999 logs/sec`
+- `0%` ingestion errors
+- `135–181 ms` ingestion p95
+- `65–75 ms` aggregate p95
+- `15/15` correctness
+- `4/4` consistency
+- `20/20` reliability
+- local scores between `92.8` and `93.3`
+
+These measurements were produced on a machine reported by the benchmark as
+approximately `0.55x` of the reference machine, so performance scores are
+environment-dependent local measurements rather than an official grade.
