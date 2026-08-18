@@ -314,6 +314,48 @@ async function aggregateUsingRollup(
         group_value
     ),
 
+    raw_boundary_rows AS (
+      SELECT
+        l."timestamp",
+        l.service,
+        l.level
+      FROM logs l
+      CROSS JOIN bounds b
+      WHERE
+        b.full_start >= b.full_end
+        AND l."timestamp" >= b.since_ts
+        AND l."timestamp" < b.until_ts
+        ${rawFilter}
+
+      UNION ALL
+
+      SELECT
+        l."timestamp",
+        l.service,
+        l.level
+      FROM logs l
+      CROSS JOIN bounds b
+      WHERE
+        b.full_start < b.full_end
+        AND l."timestamp" >= b.since_ts
+        AND l."timestamp" < b.full_start
+        ${rawFilter}
+
+      UNION ALL
+
+      SELECT
+        l."timestamp",
+        l.service,
+        l.level
+      FROM logs l
+      CROSS JOIN bounds b
+      WHERE
+        b.full_start < b.full_end
+        AND l."timestamp" >= b.full_end
+        AND l."timestamp" < b.until_ts
+        ${rawFilter}
+    ),
+
     raw_boundary_source AS (
       SELECT
         date_bin(
@@ -329,29 +371,7 @@ async function aggregateUsingRollup(
         COUNT(*)::bigint
           AS count
 
-      FROM logs l
-
-      CROSS JOIN bounds b
-
-      WHERE
-        l."timestamp" >=
-          b.since_ts
-
-        AND l."timestamp" <
-          b.until_ts
-
-        AND (
-          b.full_start >=
-            b.full_end
-
-          OR l."timestamp" <
-            b.full_start
-
-          OR l."timestamp" >=
-            b.full_end
-        )
-
-        ${rawFilter}
+      FROM raw_boundary_rows l
 
       GROUP BY
         bucket_start,
