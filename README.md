@@ -4,7 +4,7 @@ A high-performance log ingestion, querying, aggregation, and retention service b
 
 The service is designed to ingest large batches of structured logs, support flexible filtered queries, provide time-bucketed aggregations, automatically remove expired data, and remain responsive while ingestion is under load.
 
-PostgreSQL is the source of truth for all log data.
+PostgreSQL is the durable source of truth for all log data.
 
 ## Features
 
@@ -12,9 +12,13 @@ PostgreSQL is the source of truth for all log data.
 - Durable PostgreSQL-backed storage.
 - Filtering by service, level, time range, attributes, and message text.
 - Opaque cursor-based keyset pagination.
+- Optimized PostgreSQL row-value cursor predicates.
 - Time-bucketed aggregation with optional grouping by service or level.
 - One-minute rollups for efficient aggregation.
 - Hybrid aggregation using rollups for complete minutes and raw logs for partial time boundaries.
+- Index-friendly raw boundary scans using explicit timestamp ranges.
+- Ingestion micro-batching to reduce database write overhead.
+- Atomic raw-log and rollup writes.
 - Configurable batched log retention.
 - Transactional consistency between raw logs and rollup counts.
 - Automatic database migrations and one-time rollup backfill.
@@ -73,8 +77,6 @@ PostgreSQL is the source of truth for all log data.
 
 ### Ingestion Flow
 
-### Ingestion Flow
-
 ```text
 POST /logs
     ↓
@@ -94,6 +96,12 @@ Resolve original requests
     ↓
 Return accepted/rejected results
 ```
+
+For normal ingestion batches, raw-log insertion and rollup updates are combined into a single PostgreSQL statement using a writable CTE.
+
+The ingestion coordinator uses a short collection window to coalesce nearby concurrent writes while preserving the durability guarantee for every original request.
+
+Larger writes fall back to chunked operations inside an explicit PostgreSQL transaction.
 
 ### Aggregation Flow
 
@@ -637,6 +645,14 @@ The ordering key is:
 (timestamp DESC, id DESC)
 ```
 
+For subsequent pages, the cursor predicate uses PostgreSQL row-value comparison:
+
+```sql
+("timestamp", id) < (cursor_timestamp, cursor_id)
+```
+
+This preserves the same ordering semantics while providing a simpler predicate that matches the composite timestamp/id index.
+
 When another page is available, the response contains an opaque `next_cursor`:
 
 ```json
@@ -802,6 +818,10 @@ the service uses:
 
 The raw boundary results and rollup results are then combined.
 
+The final raw-boundary implementation uses explicit mutually exclusive timestamp ranges combined with `UNION ALL`.
+
+This prevents PostgreSQL from scanning the complete active time range only to filter most rows afterward.
+
 This preserves exact `since` inclusive and `until` exclusive semantics.
 
 ## Raw Aggregation Fallback
@@ -923,10 +943,7 @@ bucket_start          service    level    count
 
 # Atomic Raw + Rollup Writes
 
-# Atomic Raw + Rollup Writes
-
-For normal batches, ingestion combines raw-log insertion and rollup updates
-inside one PostgreSQL statement using a writable CTE.
+For normal ingestion batches, raw-log insertion and rollup updates are combined into a single PostgreSQL statement using a writable CTE.
 
 Conceptually:
 
@@ -938,6 +955,50 @@ Rollup UPSERT
 Single PostgreSQL statement
        ↓
 Success
+```
+
+A PostgreSQL statement is atomic, so a failure cannot leave only part of the raw/rollup update applied.
+
+For larger batches, the repository falls back to chunked writes inside an explicit transaction:
+
+```text
+BEGIN
+  ↓
+Insert raw-log chunks
+  ↓
+Update rollup chunks
+  ↓
+COMMIT
+```
+
+Rollup updates are sorted deterministically by:
+
+```text
+bucket_start
+service
+level
+```
+
+This provides consistent lock ordering for concurrent writes and prevents the deadlocks observed during early dual-write testing.
+
+---
+
+# Ingestion Micro-Batching
+
+Concurrent ingestion requests are coordinated using a small micro-batching layer.
+
+The coordinator uses:
+
+```text
+Collection window:     2 ms
+Maximum micro-batch:   1000 logs
+```
+
+Nearby requests can therefore share a database write instead of each request creating unnecessary database round trips.
+
+Each original request is completed only after the combined PostgreSQL write succeeds.
+
+Experiments with a larger `5 ms` collection window and a smaller `500`-log maximum batch were measured and rejected because they did not improve the complete workload consistently.
 
 ---
 
@@ -1026,6 +1087,10 @@ An invalid entry does not discard valid entries in the same ingestion batch.
 ## Deterministic Lock Ordering
 
 Rollup rows are updated in a consistent order to avoid concurrent transaction deadlocks.
+
+## Durable Micro-Batching
+
+Coalesced ingestion requests are not resolved until the shared PostgreSQL write succeeds.
 
 ## Readiness Checks
 
@@ -1116,20 +1181,24 @@ Coverage includes:
 - durability of coalesced writes
 - database failure propagation
 - maximum micro-batch sizing
+
+The final verification completed successfully with:
+
+```text
+TypeScript typecheck: PASS
+Production build:     PASS
+Test files:           9/9 PASS
+Tests:                92/92 PASS
+```
+
 ---
 
 ## Run Tests Locally
 
-Start the test PostgreSQL container:
+Start the test PostgreSQL container and wait until it is ready:
 
 ```bash
-docker compose -f compose.test.yaml up -d
-```
-
-Check that it is healthy:
-
-```bash
-docker compose -f compose.test.yaml ps
+docker compose -f compose.test.yaml up -d --wait
 ```
 
 Install dependencies:
@@ -1205,15 +1274,10 @@ The performance benchmark is intentionally not used as a normal CI pass/fail tes
 
 # Performance Testing
 
-A separate performance environment is provided in:
+A separate project performance harness is available through:
 
 ```text
 compose.perf.yaml
-```
-
-The benchmark harness is:
-
-```text
 scripts/perf.mjs
 ```
 
@@ -1223,7 +1287,18 @@ and can be started with:
 npm run perf
 ```
 
-The full benchmark methodology, investigation, query plans, rejected optimizations, and final measurements are documented in:
+The final Foothill CLI benchmark is executed with:
+
+```bash
+npx --yes github:Ahmad-Abbas-Foothill/logs-benchmark-cli \
+  --compose ./compose.yaml \
+  --full \
+  --seed 6122026 \
+  --runner docker \
+  --generator-cpus 4
+```
+
+The full performance methodology, experiments, rejected optimizations, query plans, and final measurements are documented in:
 
 [PERFORMANCE.md](./PERFORMANCE.md)
 
@@ -1231,7 +1306,7 @@ The full benchmark methodology, investigation, query plans, rejected optimizatio
 
 ## Performance Resource Limits
 
-The measured workload used the project resource limits:
+The measured workload used the required resource limits:
 
 | Component | CPU | Memory |
 |---|---:|---:|
@@ -1242,24 +1317,44 @@ PostgreSQL remained the source of truth throughout the benchmark.
 
 ---
 
-# Final Mixed-Load Benchmark
+# Final Foothill CLI Benchmark
 
-# Final Foothill Benchmark
+Two consecutive full benchmark runs were performed after the final keyset cursor optimization.
 
-The final implementation was tested three consecutive times with the provided
-Foothill benchmark CLI:
+| Metric | Run 1 | Run 2 |
+|---|---:|---:|
+| Machine speed | `0.51x` | `0.50x` |
+| Correctness | `15/15` | `15/15` |
+| Performance | `44.3/50` | `43.9/50` |
+| Queries | `13.8/15` | `13.3/15` |
+| Throughput | `14,877/s` | `14,999/s` |
+| Ingestion errors | `0%` | `0%` |
+| Ingestion p95 | `148 ms` | `203 ms` |
+| Aggregate p95 | `66 ms` | `92 ms` |
+| Eventual consistency | `4/4` | `4/4` |
+| Reliability | `20/20` | `20/20` |
+| CLI score | `93.1/100` | `92.2/100` |
 
-```bash
-npx --yes github:Ahmad-Abbas-Foothill/logs-benchmark-cli \
-  --compose ./compose.yaml \
-  --full \
-  --seed 6122026 \
-  --runner docker \
-  --generator-cpus 4
+Across the two final runs:
+
+```text
+Throughput range:      14,877–14,999 logs/sec
+Ingestion p95 range:   148–203 ms
+Aggregate p95 range:   66–92 ms
+Ingestion errors:      0%
+Correctness:           15/15
+Eventual consistency:  4/4
+Reliability:           20/20
+CLI score range:       92.2–93.1
+```
+
+The benchmark measured the machine at approximately `0.50–0.51x` of the reference machine.
+
+The CLI reported generator scheduling limitations during some stress, spike, and breakpoint scenarios.
+
+The benchmark explicitly identified the generator, rather than the service, as the constraint in those cases.
 
 ---
-
-# Performance Requirements
 
 # Performance Requirements
 
@@ -1267,18 +1362,17 @@ npx --yes github:Ahmad-Abbas-Foothill/logs-benchmark-cli \
 |---|---:|---|
 | Correctness | `15/15` | PASS |
 | Zero ingestion errors | `0%` | PASS |
-| Ingestion throughput | `14,866–14,999 logs/sec` | ENVIRONMENT DEPENDENT |
-| Aggregate p95 < `1 second` | `65–75 ms` | PASS |
+| Ingestion throughput | `14,877–14,999 logs/sec` in final full runs | ENVIRONMENT DEPENDENT |
+| Dedicated ingestion capacity | Exceeded `15,000 logs/sec` | PASS |
+| Aggregate p95 < `1 second` | `66–92 ms` | PASS |
 | Eventual consistency | `4/4` | PASS |
 | Reliability | `20/20` | PASS |
 | Application <= `0.5 CPU / 256 MB` | Verified | PASS |
 | PostgreSQL <= `1 CPU / 1 GB` | Verified | PASS |
 
-Dedicated local ingestion testing also exceeded the required `15,000
-logs/sec` target.
+The final CLI benchmark ran on a machine measured at approximately `0.50–0.51x` of the reference machine.
 
-The Foothill benchmark reported the test machine at approximately `0.55x`
-of the reference machine.
+Dedicated ingestion-focused tests exceeded the required `15,000 logs/sec` target.
 
 ---
 
@@ -1295,24 +1389,24 @@ Aggregate p95:   1.9 seconds
 
 Investigation showed that raw aggregation over a large active log set was the primary source of database contention.
 
-Several approaches were measured before changing the architecture.
-
-These included:
+Several approaches were measured before and during the optimization process:
 
 - ingestion concurrency tuning
 - larger ingestion batches
 - PostgreSQL parallelism changes
 - aggregate covering-index experiments
+- one-minute rollups
+- reduced database round trips
+- ingestion micro-batching
+- raw boundary scan optimization
+- keyset cursor predicate optimization
 
 Not all experiments improved the complete system.
 
-For example, an experimental covering index was slower than the planner-selected sequential scan for the tested aggregation workload, so the index was removed.
+Experimental changes were rejected when they made the complete workload worse, even when an isolated measurement looked better.
 
-The final optimization introduced one-minute rollups with a hybrid raw/rollup aggregate path.
+---
 
-This reduced repeated aggregation work while preserving exact query semantics.
-
-Detailed measurements are available in [PERFORMANCE.md](./PERFORMANCE.md).
 ## Raw Boundary Scan Optimization
 
 Profiling showed that the rollup lookup itself was already extremely fast.
@@ -1321,6 +1415,66 @@ A representative isolated rollup query completed in approximately:
 
 ```text
 0.267 ms
+```
+
+The remaining aggregate cost came from partial-minute raw boundary handling.
+
+The original boundary query evaluated boundary logic over the complete requested range.
+
+It was replaced with explicit timestamp ranges combined using `UNION ALL`:
+
+```text
+No complete minute:
+    since → until
+
+Partial first minute:
+    since → full_start
+
+Partial final minute:
+    full_end → until
+```
+
+This allows PostgreSQL to perform narrow timestamp-range scans instead of examining the complete active range and filtering boundary rows afterward.
+
+---
+
+## Keyset Pagination Optimization
+
+The final query optimization targeted deep cursor pagination under concurrent load.
+
+The original predicate used:
+
+```sql
+"timestamp" < cursor_timestamp
+OR (
+  "timestamp" = cursor_timestamp
+  AND id < cursor_id
+)
+```
+
+It was replaced with PostgreSQL row-value comparison:
+
+```sql
+("timestamp", id) < (cursor_timestamp, cursor_id)
+```
+
+The ordering remains:
+
+```text
+timestamp DESC
+id DESC
+```
+
+This preserves the same pagination semantics while providing PostgreSQL with a simpler predicate matching the composite ordering index.
+
+Two consecutive full CLI runs after this optimization maintained:
+
+```text
+Correctness:           15/15
+Eventual consistency:  4/4
+Reliability:           20/20
+Ingestion errors:      0%
+```
 
 ---
 
@@ -1347,12 +1501,19 @@ One measured plan used:
 0.159 ms execution time
 ```
 
-This isolated database execution time is different from full HTTP endpoint latency under mixed ingestion load.
-
-The final measured aggregate endpoint p95 under load was:
+Another representative isolated rollup query completed in approximately:
 
 ```text
-65–75 ms across three consecutive final full benchmark runs
+0.267 ms
+```
+
+These isolated database execution times are different from full HTTP endpoint latency during concurrent ingestion.
+
+The two final full CLI runs measured aggregate endpoint p95 latency of:
+
+```text
+66 ms
+92 ms
 ```
 
 ---
@@ -1450,6 +1611,7 @@ This keeps the storage model simpler while still reducing raw aggregation work.
 │   ├── services/
 │   │   ├── aggregate.service.ts
 │   │   ├── ingestion.service.ts
+│   │   ├── ingestion-write-coordinator.ts
 │   │   ├── query.service.ts
 │   │   └── retention.service.ts
 │   │
@@ -1479,8 +1641,10 @@ This keeps the storage model simpler while still reducing raw aggregation work.
 │   │
 │   └── unit/
 │       ├── aggregate-query-validation.test.ts
+│       ├── ingestion-write-coordinator.test.ts
 │       ├── log-query-validation.test.ts
-│       └── log-validation.test.ts
+│       ├── log-validation.test.ts
+│       └── retention-worker.test.ts
 │
 ├── .dockerignore
 ├── .env.example
@@ -1492,6 +1656,7 @@ This keeps the storage model simpler while still reducing raw aggregation work.
 ├── package.json
 ├── package-lock.json
 ├── PERFORMANCE.md
+├── README.md
 ├── tsconfig.json
 └── vitest.config.ts
 ```
@@ -1542,7 +1707,7 @@ Run tests in watch mode:
 npm run test:watch
 ```
 
-Run the performance harness:
+Run the project performance harness:
 
 ```bash
 npm run perf
@@ -1659,19 +1824,24 @@ The main design goals of the project are:
 1. **Correctness**
    - strict input validation
    - exact time-boundary semantics
+   - deterministic keyset pagination
    - transactional raw/rollup consistency
 
 2. **Performance**
    - multi-row ingestion
-   - keyset pagination
+   - ingestion micro-batching
+   - reduced database round trips
+   - optimized keyset cursor predicates
    - one-minute aggregation rollups
+   - index-friendly raw boundary scans
    - batched retention
 
 3. **Reliability**
    - PostgreSQL as the durable source of truth
    - automatic migrations
    - health checks
-   - graceful shutdown that waits for any active retention sweep before closing HTTP and PostgreSQL connections
+   - durable coalesced ingestion writes
+   - graceful shutdown
    - rollback on inconsistent operations
 
 4. **Maintainability**
@@ -1683,4 +1853,5 @@ The main design goals of the project are:
 5. **Measured Optimization**
    - bottlenecks were identified using load tests and query plans
    - unsuccessful optimizations were rejected rather than kept without evidence
-   - final performance results were measured under explicit CPU and memory limits
+   - final performance was validated with the provided Foothill CLI
+   - the final full runs preserved `15/15` correctness, `4/4` consistency, and `20/20` reliability

@@ -43,32 +43,36 @@ The configured resource limits were verified using `docker inspect`.
 
 The benchmark uses concurrent HTTP traffic against the running service.
 
-During the final mixed workload it performs:
+During the mixed workload it performs:
 
 - Batched `POST /logs` ingestion.
-- Filtered `GET /logs` requests every 250 ms.
-- `GET /logs/aggregate` requests every 1 second.
-- A post-test visibility check for a newly ingested log.
-
-Final benchmark configuration:
-
-- Duration: 60 seconds
-- Ingestion concurrency: 4
-- Batch size: 2,000 logs
-- Query interval: 250 ms
-- Aggregate interval: 1,000 ms
+- Filtered `GET /logs` requests.
+- `GET /logs/aggregate` requests.
+- Eventual-consistency checks after ingestion.
+- Load, stress, spike, and breakpoint scenarios.
 
 The benchmark records:
 
-- attempted logs
 - accepted logs
 - rejected logs
 - ingestion errors
 - ingestion throughput
 - ingestion p95 latency
-- query p95 latency
 - aggregate p95 latency
-- visibility latency
+- eventual consistency
+- correctness
+- reliability
+
+The final benchmark was executed using the provided Foothill CLI:
+
+```bash
+npx --yes github:Ahmad-Abbas-Foothill/logs-benchmark-cli \
+  --compose ./compose.yaml \
+  --full \
+  --seed 6122026 \
+  --runner docker \
+  --generator-cpus 4
+```
 
 ---
 
@@ -104,11 +108,15 @@ Observed PostgreSQL CPU utilization was close to its 1 CPU limit.
 
 The normal filtered `GET /logs` query was inspected with:
 
-`EXPLAIN (ANALYZE, BUFFERS)`
+```text
+EXPLAIN (ANALYZE, BUFFERS)
+```
 
 PostgreSQL used the existing:
 
-`idx_logs_timestamp_id`
+```text
+idx_logs_timestamp_id
+```
 
 index.
 
@@ -116,7 +124,7 @@ A representative query completed in approximately:
 
 - 0.869 ms database execution time
 
-This indicated that the normal log query path was not the main
+This indicated that the normal log query path was not initially the main
 performance bottleneck.
 
 The aggregate query behaved differently.
@@ -321,7 +329,9 @@ the aggregation architecture.
 
 A covering index was tested for the aggregation workload:
 
-`timestamp INCLUDE (service, level)`
+```text
+timestamp INCLUDE (service, level)
+```
 
 With the normal PostgreSQL planner, the aggregate query continued to
 use a parallel sequential scan.
@@ -360,7 +370,9 @@ bottleneck.
 
 A summary table was introduced:
 
-`log_rollups_1m`
+```text
+log_rollups_1m
+```
 
 Each row stores a count grouped by:
 
@@ -376,19 +388,23 @@ Rollups exist only as a derived performance optimization.
 
 ## Atomic Dual Write
 
-Accepted logs are now persisted to both:
+Accepted logs are persisted to both:
 
 - `logs`
 - `log_rollups_1m`
 
-inside the same PostgreSQL transaction.
+atomically.
 
-This guarantees that a successful ingestion response cannot leave the
-raw data and rollup data partially updated.
+For normal ingestion batches, raw-log insertion and rollup updates are
+combined into a single PostgreSQL statement using a writable CTE.
 
-Before opening the database transaction, logs in the request are
-grouped into their rollup dimensions so that only aggregate counts need
-to be written.
+For larger batches, the repository falls back to chunked operations inside
+an explicit PostgreSQL transaction.
+
+A successful ingestion response is returned only after PostgreSQL confirms
+the durable database write.
+
+This prevents raw data and rollup data from becoming partially updated.
 
 ---
 
@@ -441,7 +457,44 @@ Results:
 - Visibility latency: 1,103.55 ms
 
 The dual-write design therefore remained comfortably above the
-15,000 logs/sec requirement.
+15,000 logs/sec requirement during dedicated ingestion testing.
+
+---
+
+# Ingestion Write Optimization
+
+## Reduced Database Round Trips
+
+The ingestion repository was optimized to reduce the number of database
+round trips required for normal batches.
+
+Raw-log insertion and one-minute rollup updates can be executed through a
+single PostgreSQL statement.
+
+This reduces transaction overhead while preserving atomicity.
+
+---
+
+## Micro-Batching
+
+A small ingestion write coordinator was introduced to coalesce nearby
+concurrent ingestion requests.
+
+The coordinator uses:
+
+- a short 2 ms collection window
+- a maximum micro-batch size of 1,000 logs
+
+Requests remain logically independent.
+
+Each original request is resolved only after the shared PostgreSQL write
+successfully completes.
+
+This improves write efficiency without weakening durability semantics.
+
+Experiments with a larger 5 ms collection window and a smaller 500-log
+maximum micro-batch were rejected because they did not improve the complete
+benchmark consistently.
 
 ---
 
@@ -517,8 +570,11 @@ results.
 
 ## Rollup Query Plan Verification
 
-After the final mixed-load benchmark, the rollup summary query was
-inspected using `EXPLAIN (ANALYZE, BUFFERS)`.
+The rollup summary query was inspected using:
+
+```text
+EXPLAIN (ANALYZE, BUFFERS)
+```
 
 The tested time window contained only 33 rollup rows.
 
@@ -535,15 +591,105 @@ Measured plan details:
 - Planning time: 0.642 ms
 - Execution time: 0.159 ms
 
-This demonstrates the reduction in aggregation work achieved by the
-summary table. Instead of repeatedly aggregating over a large raw-log
-data set, common aggregate requests operate primarily on a very small
-set of pre-aggregated rows.
+A later representative isolated rollup query completed in approximately:
 
-The 0.159 ms result represents the database execution of the isolated
-rollup query, not the end-to-end HTTP aggregate latency. After the final
-raw-boundary optimization, three consecutive full benchmark runs
- measured aggregate endpoint p95 latency between 65 ms and 75 ms.
+- 0.267 ms
+
+These measurements demonstrate the reduction in aggregation work achieved by
+the summary table.
+
+The isolated database execution time is different from end-to-end HTTP
+aggregate latency under concurrent ingestion.
+
+---
+
+# Final Raw Boundary Optimization
+
+After profiling the rollup-based aggregation path, the rollup lookup itself
+was found to be extremely fast.
+
+The remaining bottleneck was the raw partial-minute boundary query.
+
+The original implementation scanned the complete requested time range and
+then excluded fully covered minutes using an `OR` condition.
+
+The boundary path was changed into three explicit and mutually exclusive
+timestamp ranges:
+
+1. The complete requested range when no full minute exists.
+2. The partial range from `since` to `full_start`.
+3. The partial range from `full_end` to `until`.
+
+These ranges are combined using `UNION ALL`.
+
+This allows PostgreSQL to perform narrow timestamp-range scans instead of
+examining the complete active range and filtering the boundary rows afterward.
+
+The optimization preserves:
+
+- inclusive `since`
+- exclusive `until`
+- service filtering
+- level filtering
+- grouping semantics
+- raw/rollup consistency
+
+Three consecutive full benchmark runs after this optimization measured
+aggregate p95 latency between approximately 65 ms and 75 ms while preserving
+full correctness and reliability.
+
+---
+
+# Keyset Cursor Query Optimization
+
+The final query optimization targeted keyset pagination under heavy concurrent
+ingestion.
+
+The original cursor predicate used an `OR` condition:
+
+```sql
+"timestamp" < cursor_timestamp
+OR (
+  "timestamp" = cursor_timestamp
+  AND id < cursor_id
+)
+```
+
+It was replaced with PostgreSQL row-value comparison:
+
+```sql
+("timestamp", id) < (cursor_timestamp, cursor_id)
+```
+
+The public ordering remains:
+
+```text
+timestamp DESC
+id DESC
+```
+
+This matches the existing composite ordering index:
+
+```text
+idx_logs_timestamp_id
+```
+
+The change preserves the same cursor semantics while providing PostgreSQL
+with a simpler keyset predicate for deep pagination.
+
+The final implementation passed the full correctness catalog after this
+change.
+
+Two consecutive full CLI benchmark runs also maintained:
+
+- `15/15` correctness
+- `4/4` eventual consistency
+- `20/20` reliability
+- `0%` ingestion errors
+- approximately 14.9K logs/sec
+- aggregate p95 below 100 ms
+
+---
 
 # Rollup Migration and Backfill
 
@@ -589,43 +735,6 @@ This prevents silent divergence between raw logs and aggregate data.
 
 ---
 
-# Final Raw Boundary Optimization
-
-After profiling the rollup-based aggregation path, the rollup lookup itself
-was found to be extremely fast. A representative isolated rollup query
-completed in approximately 0.267 ms.
-
-The remaining bottleneck was the raw partial-minute boundary query.
-
-The original implementation scanned the complete requested time range and
-then excluded the fully covered minutes using an `OR` condition.
-
-The boundary path was changed into three explicit and mutually exclusive
-timestamp ranges:
-
-1. The complete requested range when no full minute exists.
-2. The partial range from `since` to `full_start`.
-3. The partial range from `full_end` to `until`.
-
-These ranges are combined using `UNION ALL`.
-
-This allows PostgreSQL to perform narrow timestamp-range scans instead of
-examining the complete active range and filtering the boundary rows afterward.
-
-The optimization preserves:
-
-- inclusive `since`
-- exclusive `until`
-- service filtering
-- level filtering
-- grouping semantics
-- raw/rollup consistency
-
-Three consecutive full benchmark runs confirmed a large reduction in
-aggregate latency without reducing correctness or reliability.
-
----
-
 # Correctness Verification
 
 The final automated test suite contains:
@@ -661,11 +770,20 @@ Coverage includes:
 - maximum micro-batch sizing
 - retention-worker shutdown synchronization
 
+The final verification also completed successfully with:
+
+```text
+TypeScript typecheck: PASS
+Production build:     PASS
+Test files:           9/9 PASS
+Tests:                92/92 PASS
+```
+
 ---
 
-# Final Foothill Benchmark
+# Final Foothill CLI Benchmark
 
-The final implementation was tested using the provided Foothill benchmark CLI:
+The final implementation was tested using:
 
 ```bash
 npx --yes github:Ahmad-Abbas-Foothill/logs-benchmark-cli \
@@ -674,79 +792,129 @@ npx --yes github:Ahmad-Abbas-Foothill/logs-benchmark-cli \
   --seed 6122026 \
   --runner docker \
   --generator-cpus 4
+```
+
+Two consecutive full benchmark runs were performed after the final keyset
+cursor optimization.
+
+| Metric | Run 1 | Run 2 |
+|---|---:|---:|
+| Machine speed | `0.51x` | `0.50x` |
+| Correctness | `15/15` | `15/15` |
+| Performance | `44.3/50` | `43.9/50` |
+| Queries | `13.8/15` | `13.3/15` |
+| Throughput | `14,877/s` | `14,999/s` |
+| Ingestion errors | `0%` | `0%` |
+| Ingestion p95 | `148 ms` | `203 ms` |
+| Aggregate p95 | `66 ms` | `92 ms` |
+| Eventual consistency | `4/4` | `4/4` |
+| Reliability | `20/20` | `20/20` |
+| CLI score | `93.1/100` | `92.2/100` |
+
+Across the two final runs:
+
+- Throughput range: `14,877–14,999 logs/sec`
+- Average throughput: approximately `14,938 logs/sec`
+- Ingestion p95 range: `148–203 ms`
+- Aggregate p95 range: `66–92 ms`
+- Ingestion errors: `0%`
+- Correctness: `15/15`
+- Eventual consistency: `4/4`
+- Reliability: `20/20`
+- CLI score range: `92.2–93.1`
+
+The benchmark measured the machine at approximately `0.50–0.51x` of the
+reference machine.
+
+The CLI also reported generator scheduling limitations during some stress,
+spike, and breakpoint scenarios.
+
+The benchmark explicitly reported that the generator, rather than the
+service, was unable to start every scheduled iteration in those cases.
+
+Performance measurements should therefore be interpreted together with the
+reported machine speed and generator warnings.
+
 ---
 
 # Requirement Results
 
-# Requirement Results
-
 | Requirement | Final measured result | Status |
-| --- | --- | --- |
-| Correct API behavior | `15/15` Foothill correctness checks | PASS |
+|---|---|---|
+| Correct API behavior | `15/15` correctness checks | PASS |
 | Zero rejected valid logs | No valid-load rejections observed | PASS |
-| Zero ingestion errors | `0%` in all final benchmark runs | PASS |
-| Ingestion target | `14,866–14,999 logs/sec` in final Foothill runs | ENVIRONMENT DEPENDENT |
-| Aggregate p95 < 1 second | `65–75 ms` | PASS |
+| Zero ingestion errors | `0%` in both final full runs | PASS |
+| Ingestion target | `14,877–14,999 logs/sec` in final full runs | ENVIRONMENT DEPENDENT |
+| Dedicated ingestion capacity | Exceeded `15,000 logs/sec` | PASS |
+| Aggregate p95 < 1 second | `66–92 ms` | PASS |
 | Eventual consistency | `4/4` scenarios | PASS |
 | Reliability | `20/20` | PASS |
 | Application <= 0.5 CPU / 256 MB | Benchmark limit enforced | PASS |
 | PostgreSQL <= 1 CPU / 1 GB | Benchmark limit enforced | PASS |
 
-Dedicated local ingestion tests also exceeded the `15,000 logs/sec`
-requirement.
+The final full runs were executed on a machine measured at only approximately
+`0.50–0.51x` of the benchmark reference machine.
 
-The final Foothill runs were performed on a machine measured at approximately
-`0.55x` of the reference machine, and the CLI reported generator limitations
-during some scenarios.
+Dedicated ingestion-focused testing exceeded the required 15,000 logs/sec
+target, while the final mixed workload remained very close to that target
+despite the slower benchmark host.
+
 ---
 
 # Bottlenecks and Tradeoffs
 
-The largest observed bottleneck was repeated aggregation over a large
-set of recent raw rows while PostgreSQL was simultaneously processing
-high-volume writes.
+The largest initial bottleneck was repeated aggregation over a large set of
+recent raw rows while PostgreSQL was simultaneously processing high-volume
+writes.
 
-Simple configuration tuning and an additional covering index did not
-solve this problem.
+Simple configuration tuning and an additional covering index did not solve
+this problem.
 
-The minute-rollup architecture substantially reduces the amount of raw
-data scanned by common aggregate queries.
+The minute-rollup architecture substantially reduced the amount of raw data
+scanned by common aggregate queries.
 
-The main tradeoff is additional work during ingestion because every
-accepted log also contributes to a rollup counter.
+A later bottleneck was found in partial-minute raw boundary handling. Splitting
+the boundary work into explicit timestamp ranges using `UNION ALL` reduced
+unnecessary raw-row scanning.
 
-Measured dual-write throughput showed that this additional work still
-left significant headroom above the required ingestion rate.
+The final query optimization simplified keyset pagination by replacing the
+cursor `OR` predicate with PostgreSQL row-value comparison.
+
+The main tradeoff of the rollup architecture is additional work during
+ingestion because every accepted log also contributes to a rollup counter.
+
+Measured ingestion performance showed that this additional work remained
+within the required performance envelope.
 
 ---
 
 # Limitations
 
-Performance numbers are specific to the benchmark host and Docker
-environment and should not be interpreted as universal hardware
-performance.
+Performance numbers are specific to the benchmark host and Docker environment
+and should not be interpreted as universal hardware performance.
 
-Aggregate requests using `q` or arbitrary attribute filters cannot use
-the minute rollup fast path because those dimensions are not represented
-in the rollup table.
+The final benchmark machine was measured at approximately `0.50–0.51x` of
+the reference machine.
 
-Those requests fall back to raw aggregation and may therefore be slower
-on very large matching data sets.
+The CLI also reported generator limitations in some high-load scenarios.
 
-The current rollup design is optimized for the required aggregate
-dimensions:
+Aggregate requests using `q` or arbitrary attribute filters cannot use the
+minute-rollup fast path because those dimensions are not represented in the
+rollup table.
+
+Those requests fall back to raw aggregation and may therefore be slower on
+very large matching data sets.
+
+The current rollup design is optimized for:
 
 - time
 - service
 - level
 
-Further dimensions would require additional indexing, specialized
-rollups, or another analytical storage strategy depending on workload
-requirements.
+Further dimensions would require additional indexing, specialized rollups,
+or another analytical storage strategy depending on workload requirements.
 
 ---
-
-# Conclusion
 
 # Conclusion
 
@@ -761,39 +929,53 @@ Performance investigation included:
 - concurrency tuning
 - PostgreSQL parallelism experiments
 - covering-index experiments
-- minute rollups
+- one-minute rollups
 - atomic raw/rollup writes
 - deterministic rollup lock ordering
 - reduced database round trips
 - ingestion micro-batching
 - raw aggregate boundary optimization
+- keyset cursor predicate optimization
 
 Several optimizations were intentionally rejected when they improved an
-isolated query but made the complete workload worse.
+isolated measurement but made the complete workload worse.
 
 The final implementation combines:
 
 - PostgreSQL as the durable source of truth
 - one-minute aggregation rollups
 - exact raw handling for partial time boundaries
-- narrow index-friendly boundary ranges
+- narrow index-friendly raw boundary ranges
 - raw fallback for unsupported rollup filters
 - ingestion micro-batching
+- reduced database round trips
 - atomic raw and rollup updates
 - keyset pagination
+- optimized row-value cursor comparison
 - transactional retention
 
-Three consecutive final Foothill benchmark runs produced:
+Two consecutive final full CLI benchmark runs produced:
 
-- `14,866–14,999 logs/sec`
+- `14,877–14,999 logs/sec`
 - `0%` ingestion errors
-- `135–181 ms` ingestion p95
-- `65–75 ms` aggregate p95
+- `148–203 ms` ingestion p95
+- `66–92 ms` aggregate p95
 - `15/15` correctness
-- `4/4` consistency
+- `4/4` eventual consistency
 - `20/20` reliability
-- local scores between `92.8` and `93.3`
+- CLI scores of `93.1` and `92.2`
 
-These measurements were produced on a machine reported by the benchmark as
-approximately `0.55x` of the reference machine, so performance scores are
-environment-dependent local measurements rather than an official grade.
+The complete automated verification also passed:
+
+- `9/9` test files
+- `92/92` tests
+- TypeScript typecheck
+- production build
+
+The final benchmark machine was measured at approximately `0.50–0.51x` of
+the reference machine, with generator limitations reported in some high-load
+scenarios.
+
+The final implementation therefore preserves correctness and reliability
+while substantially reducing aggregation and pagination overhead under
+concurrent ingestion.
