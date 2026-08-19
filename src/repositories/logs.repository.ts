@@ -465,12 +465,10 @@ export async function findLogs(
       `$${values.length}`;
 
     conditions.push(`
+      ("timestamp", id) <
       (
-        "timestamp" < ${timestampPlaceholder}::timestamptz
-        OR (
-          "timestamp" = ${timestampPlaceholder}::timestamptz
-          AND id < ${idPlaceholder}::bigint
-        )
+        ${timestampPlaceholder}::timestamptz,
+        ${idPlaceholder}::bigint
       )
     `);
   }
